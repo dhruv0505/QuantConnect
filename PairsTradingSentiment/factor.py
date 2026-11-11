@@ -32,11 +32,14 @@ dataset (SECReport10K / SECReport10Q), chosen by TEXT_FACTOR:
 Records are stamped at midnight of the filing date, but filings often land after the
 close, so each value is usable from the next day.
 
-TONE WORD LISTS: for any real result, upload the official Loughran-McDonald master
-dictionary CSV (Notre Dame SRAF; check its license terms) to the Object Store under
-TONE_WORDS_KEY. Its "Positive" and "Negative" columns are nonzero for words in each list.
-If the key is missing, the factor falls back to a SMALL built-in seed list and says so in
-the log and the SUMMARY line. The seed list is for plumbing tests only.
+TONE WORD LISTS (first one found wins):
+  1. lm_words.py in this project: POSITIVE and NEGATIVE frozensets built from the official
+     Loughran-McDonald master dictionary (Notre Dame SRAF; check its license terms). Needs no
+     Object Store, so it works on a free organization.
+  2. The master dictionary CSV in the Object Store under TONE_WORDS_KEY (its "Positive" and
+     "Negative" columns are nonzero for words in each list). Paid organizations only.
+  3. A SMALL built-in seed list, with a warning in the log and the SUMMARY line. The seed list
+     is for plumbing tests only.
 Not handled: negation ("not improved"), and section choice (the whole main document counts).
 """
 from AlgorithmImports import *
@@ -234,8 +237,14 @@ class Factor:
         return text
 
     def _load_tone_lists(self):
-        """(positive, negative, source) from the Object Store CSV, else the built-in seed lists."""
+        """(positive, negative, source): lm_words.py, else the Object Store CSV, else the seed lists."""
         algo, key = self.algo, self.TONE_WORDS_KEY
+        try:
+            from lm_words import POSITIVE, NEGATIVE
+            if POSITIVE and NEGATIVE:
+                return frozenset(POSITIVE), frozenset(NEGATIVE), "project:lm_words.py"
+        except ImportError:
+            algo.log("FACTOR lm_words.py not found in the project")
         try:
             if key and algo.object_store.contains_key(key):
                 positive, negative = load_tone_words(algo.object_store.read(key))
