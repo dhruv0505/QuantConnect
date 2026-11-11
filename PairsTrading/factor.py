@@ -1,199 +1,222 @@
 """
-The pluggable factor for main.py. Replace this file to test a different factor;
-main.py doesn't need to change.
+Relative Gross Margin Momentum factor for the pluggable pairs-trading strategy.
 
-CONTRACT (all main.py relies on)
-  class Factor:
-      name: str                          short label for the SUMMARY log
-      __init__(self, algorithm, param)   algorithm = the running QCAlgorithm;
-                                         param(name, default) reads a project parameter,
-                                         typed like the default (use it for your settings)
-      series(self, symbol)               [(usable_from, value), ...] sorted by time.
-                                         usable_from is the first algorithm time the value
-                                         may be used (no lookahead). Empty = no data, so
-                                         the stock can't join a pair when REQUIRE_FACTOR
-                                         is on. Called often, so cache and fetch
-                                         incrementally.
-      summary(self)                      short string of counts for the SUMMARY log
+Replace PairsTrading/factor.py with this file; main.py does not change.
 
-main.py takes F_i - F_j as the pair's factor difference, optionally standardizes F across
-the stocks in active pairs (STANDARDIZE_FACTOR), and regresses AG on it each quarter.
+CONTRACT (used by main.py)
+    Factor(algorithm, param)
+    .name: short label for SUMMARY
+    .series(symbol): [(usable_from, value), ...], sorted chronologically
+    .summary(): counts for SUMMARY
 
-THIS FACTOR: text of each stock's latest 10-K/10-Q from QuantConnect's free US SEC Filings
-dataset (SECReport10K / SECReport10Q), chosen by TEXT_FACTOR:
-  "ld"  = lexical density: content words / all words. Content words are every word not
-          in FUNCTION_WORDS, an approximation of a part-of-speech count.
-  "sim" = cosine similarity of word counts to the company's previous filing of the same
-          type (10-Q vs prior 10-Q, 10-K vs prior 10-K; Cohen, Malloy & Nguyen "Lazy Prices").
-Records are stamped at midnight of the filing date, but filings often land after the
-close, so each value is usable from the next day.
+FACTOR
+    GM_i(q) = (Revenue_i(q) - COGS_i(q)) / Revenue_i(q)
+    F_i(q)  = GM_i(q) - GM_i(q-4)
+
+The strategy's existing main.py computes F_i - F_j, optionally standardizes
+F across active stocks, and regresses adjusted price gaps on the pair factor.
+
+Morningstar's OperationRatios.GrossMargin.ThreeMonths supplies the quarterly
+margin. We identify the underlying financial quarter by
+FinancialStatements.PeriodEndingDate.ThreeMonths and compare it to the same
+fiscal quarter roughly one year earlier (allowing for 52/53-week calendars).
+
+Point-in-time safeguards:
+  * Read historical Fundamental snapshots, not today's fundamentals for old dates.
+  * Use only the first observed value for each fiscal period.
+  * A new value becomes usable only AFTER both its observed snapshot date and
+    the reported filing date (when provided), conservatively one day later.
+  * Missing prior-year quarters produce no factor rather than a fabricated zero.
+  * Cache snapshots and fetch incrementally; do not recalculate the full history.
+
+Data: QuantConnect Morningstar US Fundamental Data, no extra SEC subscription.
 """
+
 from AlgorithmImports import *
-from datetime import timedelta
-from collections import Counter
-import html
-import re
-import zlib
-import numpy as np
+from datetime import date, datetime, timedelta
+import math
 
-# This factor's settings. Each can be overridden by a project parameter of the same name.
+
+# Project parameters can override these via main.py's param(name, default).
 DEFAULTS = {
-    "TEXT_FACTOR": "ld",           # "ld" = lexical density, "sim" = similarity to previous filing
-    "LD_VARIANT": "all",           # "all" = 10-K and 10-Q, "10k" = 10-K only
-    "FILING_LOOKBACK_DAYS": 600,   # filings older than this aren't fetched
-    "MIN_FILING_WORDS": 2000,      # shorter main documents are treated as failed extractions
+    "GM_LOOKBACK_DAYS": 1100,       # ~3 years: covers prior-year and recent factor history
+    "GM_REFRESH_DAYS": 7,          # don't rerequest daily snapshots on repeated calls
+    "GM_YOY_TOLERANCE_DAYS": 45,   # accommodates shifting fiscal quarter ends / 53-week years
 }
-TEXT_FACTORS = ("ld", "sim")
-HASH_DIM = 1 << 14                  # word-count vector size for similarity (memory bound)
-FORMS_10K = ("10-K", "10-K405", "10-KT")       # amendments (10-K/A) are partial, so excluded
-FORMS_10Q = ("10-Q", "10-QT")
-
-# Function words: everything else counts as a content (lexical) word.
-FUNCTION_WORDS = frozenset("""
-a an the this that these those each every either neither some any no all both half
-another such what which whose whatever whichever
-i me my mine myself we us our ours ourselves you your yours yourself yourselves he him his
-himself she her hers herself it its itself they them their theirs themselves one ones
-who whom whoever someone somebody something anyone anybody anything everyone everybody
-everything nobody nothing none
-about above across after against along amid among amongst around as at before behind below
-beneath beside besides between beyond by despite down during except for from in inside into
-like near of off on onto out outside over past per since than through throughout till to
-toward towards under underneath unlike until up upon via with within without
-and or but nor so yet because although though while whereas if unless whether once whenever
-wherever where when whereby wherein whereof thereof therein thereby hereby herein hereof
-hereunder thereunder
-be am is are was were been being have has had having do does did doing done
-will would shall should can could may might must ought
-not n't to there here then thus hence therefore however also too very just only even
-s t ll d ve re m
-""".split())
-
-_IX_HEADER_RE = re.compile(r"<ix:header>.*?</ix:header>", re.S | re.I)
-_HIDDEN_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.S | re.I)
-_TAG_RE = re.compile(r"<[^>]+>")
-_WORD_RE = re.compile(r"[a-z]+")
 
 
-# ---------- Pure text functions (no LEAN dependency) ----------
-
-def filing_text(raw):
-    """Plain text of an inline-XBRL/HTML filing document: drop the hidden XBRL header,
-    scripts and styles, then all tags, then decode entities such as &#174; and &nbsp;."""
-    text = _IX_HEADER_RE.sub(" ", raw)
-    text = _HIDDEN_RE.sub(" ", text)
-    text = _TAG_RE.sub(" ", text)
-    return html.unescape(text)
-
-
-def words_of(text):
-    """Lower-cased words. Words are runs of letters, so numbers in tables are ignored;
-    apostrophes split words ("company's" -> company, s)."""
-    return _WORD_RE.findall(text.lower())
-
-
-def lexical_density(words, min_words=0):
-    """Share of words that are content words, or None if there are fewer than min_words."""
-    if not words or len(words) < min_words:
+def _as_date(value):
+    """Convert Python or pythonnet .NET date objects to a Python date."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if value is None:
         return None
-    return sum(1 for w in words if w not in FUNCTION_WORDS) / len(words)
+    try:
+        return date(int(value.year), int(value.month), int(value.day))
+    except (AttributeError, ValueError, TypeError):
+        try:
+            return date(int(value.Year), int(value.Month), int(value.Day))
+        except (AttributeError, ValueError, TypeError):
+            return None
 
 
-def count_vector(words, dim=HASH_DIM):
-    """Word counts hashed into a fixed-size vector (crc32, so identical across runs).
-    Collisions are rare enough at 16k slots to barely move a cosine similarity."""
-    vec = np.zeros(dim, dtype=np.float32)
-    for word, n in Counter(words).items():
-        vec[zlib.crc32(word.encode()) % dim] += n
-    return vec
+def _valid_date(value):
+    result = _as_date(value)
+    return result if result is not None and result.year > 1900 else None
 
 
-def cosine_similarity(u, v):
-    """Cosine of two count vectors: 1.0 = same word mix, lower = rewritten."""
-    norm = float(np.linalg.norm(u)) * float(np.linalg.norm(v))
-    return float(u @ v) / norm if norm > 0 else None
+def _quarterly_margin(fundamental):
+    """Three-month gross margin. Missing/invalid data is NOT treated as zero."""
+    field = fundamental.operation_ratios.gross_margin
+    # has_value tests the default (three-month) period and avoids treating
+    # absent values, usually zero in the data provider, as genuine margins.
+    if not field.has_value:
+        return None
+    number = float(field.three_months)
+    return number if math.isfinite(number) else None
 
 
-# ---------- Factor ----------
+def _quarter_end(fundamental):
+    """The period end to which the three-month financial statement relates."""
+    try:
+        return _valid_date(fundamental.financial_statements.period_ending_date.three_months)
+    except (AttributeError, ValueError, TypeError):
+        return None
+
+
+def _filing_date(fundamental):
+    """Publication date of the corresponding three-month financial statement."""
+    try:
+        return _valid_date(fundamental.financial_statements.file_date.three_months)
+    except (AttributeError, ValueError, TypeError):
+        # Availability is still tied to historical snapshot dates, not today's data.
+        return None
+
+
+def _previous_year_margin(period_end, known_margins, tolerance):
+    """Find margin of matching fiscal quarter one year earlier, or None.
+
+    known_margins maps fiscal-quarter-end dates to (available_date, margin).
+    Adjacent quarters (~90 days apart) cannot be mistaken for the prior year.
+    """
+    target = period_end - timedelta(days=365)
+    choices = [q for q in known_margins
+               if 365 - tolerance <= (period_end - q).days <= 365 + tolerance]
+    if not choices:
+        return None
+    closest = min(choices, key=lambda q: abs((q - target).days))
+    return known_margins[closest][1]
+
 
 class Factor:
-    """Filing-text factor (lexical density or similarity) per stock."""
+    """Year-over-year quarterly gross margin momentum, per equity."""
 
     def __init__(self, algorithm, param):
         self.algo = algorithm
         for name, default in DEFAULTS.items():
             setattr(self, name, param(name, default))
-        variants = {"all": ((SECReport10Q, SECReport10K), FORMS_10Q + FORMS_10K),
-                    "10k": ((SECReport10K,), FORMS_10K)}
-        if self.LD_VARIANT not in variants:
-            raise ValueError(f"LD_VARIANT must be one of {tuple(variants)}, got {self.LD_VARIANT!r}")
-        if self.TEXT_FACTOR not in TEXT_FACTORS:
-            raise ValueError(f"TEXT_FACTOR must be one of {TEXT_FACTORS}, got {self.TEXT_FACTOR!r}")
-        self._filing_types, self._forms = variants[self.LD_VARIANT]
-        self.name = f"{self.TEXT_FACTOR}/{self.LD_VARIANT}"
-        # Filled incrementally so each filing is parsed once: symbol -> [(usable_from, value)],
-        # symbol -> fetched-up-to time, filing keys seen.
-        self._series, self._fetched, self._seen = {}, {}, set()
-        self._prev_vec = {}            # (symbol, "10-K"/"10-Q") -> count vector of last filing
-        self._stats = {"used": 0, "other_form": 0, "too_short": 0, "no_previous": 0, "errors": 0}
+        if self.GM_LOOKBACK_DAYS < 500:
+            raise ValueError("GM_LOOKBACK_DAYS must be >= 500 to form YoY changes")
+        if self.GM_REFRESH_DAYS < 1:
+            raise ValueError("GM_REFRESH_DAYS must be >= 1")
+        if not 0 <= self.GM_YOY_TOLERANCE_DAYS < 60:
+            raise ValueError("GM_YOY_TOLERANCE_DAYS must be between 0 and 59")
+
+        self.name = "gross_margin_yoy"
+        self._series = {}   # symbol -> list[(usable_from datetime, YoY delta)]
+        self._margins = {}  # symbol -> {quarter_end date: (usable_from datetime, margin)}
+        self._fetched = {}  # symbol -> last successful request end datetime
+        self._stats = {
+            "rows": 0, "quarters": 0, "yoy": 0,
+            "missing_margin": 0, "missing_period": 0,
+            "missing_previous": 0, "errors": 0,
+        }
 
     def series(self, symbol):
-        """[(usable_from, value)] for the stock's 10-K/10-Q filings, sorted. Only filings
-        published since the last call are fetched and parsed."""
+        """Return time-stamped, point-in-time YoY margins for `symbol`."""
         now = self.algo.time
-        start = self._fetched.get(symbol, now - timedelta(days=self.FILING_LOOKBACK_DAYS))
-        if start < now:
-            series = self._series.setdefault(symbol, [])
-            for cls in self._filing_types:
-                self._read_filings(cls, symbol, start, now, series)
-            series.sort(key=lambda item: item[0])
-            self._fetched[symbol] = now
-        return self._series.get(symbol, [])
+        last = self._fetched.get(symbol)
+        if last is not None and now - last < timedelta(days=self.GM_REFRESH_DAYS):
+            return self._series.get(symbol, [])
 
-    def summary(self):
-        return f"filings={self._stats} filing_stocks={len(self._series)}"
+        start = (last - timedelta(days=3)) if last is not None else \
+                (now - timedelta(days=self.GM_LOOKBACK_DAYS))
+        if start >= now:
+            return self._series.get(symbol, [])
 
-    def _read_filings(self, cls, symbol, start, end, series):
-        """Append (usable_from, value) for each 10-K/10-Q filing of `cls` in [start, end].
-        History is chronological, so for "sim" each filing is compared with the previous
-        filing of the same family seen for this stock, including across fetch calls."""
-        algo = self.algo
-        dataset = algo.add_data(cls, symbol, Resolution.DAILY).symbol
         try:
-            for row in algo.history[cls](dataset, start, end, Resolution.DAILY):
-                report = row.report
-                form = str(report.form_type or "").upper() if report is not None else ""
-                if form not in self._forms:             # e.g. 8-K press releases mislabeled
-                    self._stats["other_form"] += 1
+            # Typed history returns Fundamental objects rather than an enormous
+            # DataFrame of nested corporate fields. History works even when the
+            # symbol is not currently subscribed to the algorithm.
+            rows = self.algo.history[Fundamental](symbol, start, now, Resolution.DAILY)
+            margins = self._margins.setdefault(symbol, {})
+            values = self._series.setdefault(symbol, [])
+
+            for row in rows:
+                self._stats["rows"] += 1
+                period_end = _quarter_end(row)
+                if period_end is None:
+                    self._stats["missing_period"] += 1
                     continue
-                key = (symbol, form, row.end_time)
-                if key in self._seen:                    # fetch windows overlap at the edges
+                if period_end in margins:
+                    continue  # filled daily snapshots; process each fiscal quarter once
+
+                try:
+                    margin = _quarterly_margin(row)
+                except Exception as error:
+                    # Some Morningstar period fields were retired in 2026.
+                    self._stats["errors"] += 1
+                    if self._stats["errors"] <= 5:
+                        self.algo.log(f"FACTOR {symbol.value} gross_margin: {error}")
                     continue
-                self._seen.add(key)
-                docs = list(report.documents or [])
-                main = next((d for d in docs if str(d.form_type or "").upper() == form),
-                            docs[0] if docs else None)  # the filing itself, not its exhibits
-                words = words_of(filing_text(main.text or "")) if main is not None else []
-                if len(words) < max(1, self.MIN_FILING_WORDS):
-                    self._stats["too_short"] += 1
+                if margin is None:
+                    self._stats["missing_margin"] += 1
                     continue
-                if self.TEXT_FACTOR == "ld":
-                    value = lexical_density(words)
-                else:
-                    family = "10-K" if form in FORMS_10K else "10-Q"
-                    vec = count_vector(words)
-                    previous = self._prev_vec.get((symbol, family))
-                    self._prev_vec[(symbol, family)] = vec
-                    value = cosine_similarity(previous, vec) if previous is not None else None
-                    if value is None:                   # first filing seen: nothing to compare
-                        self._stats["no_previous"] += 1
-                        continue
-                # Stamped at midnight of the filing date; usable the next day (no lookahead).
-                series.append((row.end_time + timedelta(days=1), value))
-                self._stats["used"] += 1
+
+                observed = _valid_date(row.end_time)
+                if observed is None:
+                    continue
+                filing = _filing_date(row)
+                # One-day cushion after publication/observation, protecting
+                # against intraday filing timestamps and backtest lookahead.
+                usable_from = datetime.combine(
+                    max(d for d in (observed, filing) if d is not None) + timedelta(days=1),
+                    datetime.min.time(),
+                )
+                if usable_from > now:
+                    # History should not contain future data, but don't insert
+                    # a not-yet-published quarter if it does.
+                    continue
+
+                previous = _previous_year_margin(
+                    period_end, margins, self.GM_YOY_TOLERANCE_DAYS
+                )
+                margins[period_end] = (usable_from, margin)
+                self._stats["quarters"] += 1
+                if previous is None:
+                    self._stats["missing_previous"] += 1
+                    continue
+
+                values.append((usable_from, margin - previous))
+                self._stats["yoy"] += 1
+
+            values.sort(key=lambda item: item[0])
+            self._fetched[symbol] = now
         except Exception as error:
             self._stats["errors"] += 1
             if self._stats["errors"] <= 5:
-                algo.log(f"FACTOR {symbol.value} {cls.__name__}: {error}")
-        finally:
-            algo.remove_security(dataset)
+                name = getattr(symbol, "value", str(symbol))
+                self.algo.log(f"FACTOR {name} Fundamental: {error}")
+
+        return self._series.get(symbol, [])
+
+    def summary(self):
+        usable = sum(bool(v) for v in self._series.values())
+        return (f"gm_stocks={usable}/{len(self._series)} "
+                f"gm_quarters={self._stats['quarters']} "
+                f"gm_yoy={self._stats['yoy']} "
+                f"gm_errors={self._stats['errors']} "
+                f"gm_missing_prev={self._stats['missing_previous']} "
+                f"gm_missing_margin={self._stats['missing_margin']}")
