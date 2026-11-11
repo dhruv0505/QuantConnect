@@ -1,5 +1,5 @@
 """
-The pluggable factor for main.py. Replace this file to test a different factor;
+The pluggable factor for main.py: FUNDAMENTALS version (drop-in replacement for the text factor).
 main.py doesn't need to change.
 
 CONTRACT (all main.py relies on)
@@ -7,193 +7,180 @@ CONTRACT (all main.py relies on)
       name: str                          short label for the SUMMARY log
       __init__(self, algorithm, param)   algorithm = the running QCAlgorithm;
                                          param(name, default) reads a project parameter,
-                                         typed like the default (use it for your settings)
+                                         typed like the default
       series(self, symbol)               [(usable_from, value), ...] sorted by time.
-                                         usable_from is the first algorithm time the value
-                                         may be used (no lookahead). Empty = no data, so
-                                         the stock can't join a pair when REQUIRE_FACTOR
-                                         is on. Called often, so cache and fetch
-                                         incrementally.
+                                         usable_from = first algorithm time the value may be
+                                         used (no lookahead). Empty = no data.
       summary(self)                      short string of counts for the SUMMARY log
 
-main.py takes F_i - F_j as the pair's factor difference, optionally standardizes F across
-the stocks in active pairs (STANDARDIZE_FACTOR), and regresses AG on it each quarter.
+THIS FACTOR: Morningstar US Fundamental data from QuantConnect, read with
+history[Fundamental](symbol, start, end). Settings (each can be a project parameter):
 
-THIS FACTOR: text of each stock's latest 10-K/10-Q from QuantConnect's free US SEC Filings
-dataset (SECReport10K / SECReport10Q), chosen by TEXT_FACTOR:
-  "ld"  = lexical density: content words / all words. Content words are every word not
-          in FUNCTION_WORDS, an approximation of a part-of-speech count.
-  "sim" = cosine similarity of word counts to the company's previous filing of the same
-          type (10-Q vs prior 10-Q, 10-K vs prior 10-K; Cohen, Malloy & Nguyen "Lazy Prices").
-Records are stamped at midnight of the filing date, but filings often land after the
-close, so each value is usable from the next day.
+  FUND_METRICS   comma-separated metric names, averaged into one number per stock.
+                 Choices: gross_margin, ebitda_margin, operation_margin, net_margin,
+                          revenue_growth
+                 Examples: "gross_margin"   or   "gross_margin,ebitda_margin"
+  FUND_TRANSFORM "yoy"   = change versus the same period a year earlier (default). Margins
+                           are ratios, so this is the change in margin. Removes seasonality
+                           and matches the pair's relative price move better than a level.
+                 "level" = the raw value, no change calculation.
+  FUND_PERIOD    which window of each field to read first: "twelve_months" (trailing
+                 twelve months, default) or "three_months" or "value" (Morningstar's default
+                 window). If a window is missing, "value" is tried next.
+
+A new value is stored only when the number CHANGES, i.e. when a new filing arrives. These
+fields only change at filings, which is what makes this safe. Do not add daily-moving fields
+such as P/E or market cap here (the series would fill with one row per day, and a price-based
+value would leak the price into the factor).
+
+TIMING: the new Morningstar dataset stamps ratio-type fields with the filing date. A value is
+usable from the day AFTER its row's end_time, because filings can arrive after the close.
+
+If a field was retired by Morningstar it throws NotSupportedException; the message names the
+replacement. The first error per metric is written to the log as "FACTOR ...".
 """
 from AlgorithmImports import *
 from datetime import timedelta
-from collections import Counter
-import html
-import re
-import zlib
-import numpy as np
 
 # This factor's settings. Each can be overridden by a project parameter of the same name.
 DEFAULTS = {
-    "TEXT_FACTOR": "ld",           # "ld" = lexical density, "sim" = similarity to previous filing
-    "LD_VARIANT": "all",           # "all" = 10-K and 10-Q, "10k" = 10-K only
-    "FILING_LOOKBACK_DAYS": 600,   # filings older than this aren't fetched
-    "MIN_FILING_WORDS": 2000,      # shorter main documents are treated as failed extractions
+    "FUND_METRICS": "gross_margin",   # comma-separated, see the list above
+    "FUND_TRANSFORM": "yoy",          # "yoy" or "level"
+    "FUND_PERIOD": "twelve_months",   # "twelve_months", "three_months" or "value"
+    "FILING_LOOKBACK_DAYS": 900,      # history fetched on first use; >1 year so YoY exists
+    "YOY_MIN_DAYS": 330,              # the "year ago" value must be this many days earlier...
+    "YOY_MAX_DAYS": 400,              # ...and at most this many (closest to 365 is chosen)
 }
-TEXT_FACTORS = ("ld", "sim")
-HASH_DIM = 1 << 14                  # word-count vector size for similarity (memory bound)
-FORMS_10K = ("10-K", "10-K405", "10-KT")       # amendments (10-K/A) are partial, so excluded
-FORMS_10Q = ("10-Q", "10-QT")
 
-# Function words: everything else counts as a content (lexical) word.
-FUNCTION_WORDS = frozenset("""
-a an the this that these those each every either neither some any no all both half
-another such what which whose whatever whichever
-i me my mine myself we us our ours ourselves you your yours yourself yourselves he him his
-himself she her hers herself it its itself they them their theirs themselves one ones
-who whom whoever someone somebody something anyone anybody anything everyone everybody
-everything nobody nothing none
-about above across after against along amid among amongst around as at before behind below
-beneath beside besides between beyond by despite down during except for from in inside into
-like near of off on onto out outside over past per since than through throughout till to
-toward towards under underneath unlike until up upon via with within without
-and or but nor so yet because although though while whereas if unless whether once whenever
-wherever where when whereby wherein whereof thereof therein thereby hereby herein hereof
-hereunder thereunder
-be am is are was were been being have has had having do does did doing done
-will would shall should can could may might must ought
-not n't to there here then thus hence therefore however also too very just only even
-s t ll d ve re m
-""".split())
+# metric name -> (group on the Fundamental object, property name). Check the names with
+# autocomplete if one fails; to add a metric, add a line here.
+METRICS = {
+    "gross_margin": ("operation_ratios", "gross_margin"),
+    "ebitda_margin": ("operation_ratios", "ebitda_margin"),
+    "operation_margin": ("operation_ratios", "operation_margin"),
+    "net_margin": ("operation_ratios", "net_margin"),
+    "revenue_growth": ("operation_ratios", "revenue_growth"),
+}
+TRANSFORMS = ("yoy", "level")
 
-_IX_HEADER_RE = re.compile(r"<ix:header>.*?</ix:header>", re.S | re.I)
-_HIDDEN_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.S | re.I)
-_TAG_RE = re.compile(r"<[^>]+>")
-_WORD_RE = re.compile(r"[a-z]+")
-
-
-# ---------- Pure text functions (no LEAN dependency) ----------
-
-def filing_text(raw):
-    """Plain text of an inline-XBRL/HTML filing document: drop the hidden XBRL header,
-    scripts and styles, then all tags, then decode entities such as &#174; and &nbsp;."""
-    text = _IX_HEADER_RE.sub(" ", raw)
-    text = _HIDDEN_RE.sub(" ", text)
-    text = _TAG_RE.sub(" ", text)
-    return html.unescape(text)
-
-
-def words_of(text):
-    """Lower-cased words. Words are runs of letters, so numbers in tables are ignored;
-    apostrophes split words ("company's" -> company, s)."""
-    return _WORD_RE.findall(text.lower())
-
-
-def lexical_density(words, min_words=0):
-    """Share of words that are content words, or None if there are fewer than min_words."""
-    if not words or len(words) < min_words:
-        return None
-    return sum(1 for w in words if w not in FUNCTION_WORDS) / len(words)
-
-
-def count_vector(words, dim=HASH_DIM):
-    """Word counts hashed into a fixed-size vector (crc32, so identical across runs).
-    Collisions are rare enough at 16k slots to barely move a cosine similarity."""
-    vec = np.zeros(dim, dtype=np.float32)
-    for word, n in Counter(words).items():
-        vec[zlib.crc32(word.encode()) % dim] += n
-    return vec
-
-
-def cosine_similarity(u, v):
-    """Cosine of two count vectors: 1.0 = same word mix, lower = rewritten."""
-    norm = float(np.linalg.norm(u)) * float(np.linalg.norm(v))
-    return float(u @ v) / norm if norm > 0 else None
-
-
-# ---------- Factor ----------
 
 class Factor:
-    """Filing-text factor (lexical density or similarity) per stock."""
+    """Fundamentals factor (margin change or level) per stock."""
 
     def __init__(self, algorithm, param):
         self.algo = algorithm
         for name, default in DEFAULTS.items():
             setattr(self, name, param(name, default))
-        variants = {"all": ((SECReport10Q, SECReport10K), FORMS_10Q + FORMS_10K),
-                    "10k": ((SECReport10K,), FORMS_10K)}
-        if self.LD_VARIANT not in variants:
-            raise ValueError(f"LD_VARIANT must be one of {tuple(variants)}, got {self.LD_VARIANT!r}")
-        if self.TEXT_FACTOR not in TEXT_FACTORS:
-            raise ValueError(f"TEXT_FACTOR must be one of {TEXT_FACTORS}, got {self.TEXT_FACTOR!r}")
-        self._filing_types, self._forms = variants[self.LD_VARIANT]
-        self.name = f"{self.TEXT_FACTOR}/{self.LD_VARIANT}"
-        # Filled incrementally so each filing is parsed once: symbol -> [(usable_from, value)],
-        # symbol -> fetched-up-to time, filing keys seen.
-        self._series, self._fetched, self._seen = {}, {}, set()
-        self._prev_vec = {}            # (symbol, "10-K"/"10-Q") -> count vector of last filing
-        self._stats = {"used": 0, "other_form": 0, "too_short": 0, "no_previous": 0, "errors": 0}
+        self._metrics = [m.strip() for m in self.FUND_METRICS.split(",") if m.strip()]
+        unknown = [m for m in self._metrics if m not in METRICS]
+        if not self._metrics or unknown:
+            raise ValueError(f"FUND_METRICS must be a comma list from {tuple(METRICS)}, "
+                             f"got {self.FUND_METRICS!r}")
+        if self.FUND_TRANSFORM not in TRANSFORMS:
+            raise ValueError(f"FUND_TRANSFORM must be one of {TRANSFORMS}, got {self.FUND_TRANSFORM!r}")
+        # Window of each field to try, in order, without repeats.
+        self._periods = list(dict.fromkeys([self.FUND_PERIOD, "value"]))
+        self.name = f"fund/{'+'.join(self._metrics)}/{self.FUND_TRANSFORM}"
+        # Filled incrementally so each day of history is read once:
+        # symbol -> [(usable_from, raw level)], symbol -> fetched-up-to time,
+        # symbol -> [(usable_from, factor value)]
+        self._levels, self._fetched, self._series = {}, {}, {}
+        self._warned = set()
+        self._stats = {"rows": 0, "levels": 0, "no_value": 0, "no_data": 0, "errors": 0}
+
+    # ---------- Contract ----------
 
     def series(self, symbol):
-        """[(usable_from, value)] for the stock's 10-K/10-Q filings, sorted. Only filings
-        published since the last call are fetched and parsed."""
+        """[(usable_from, value)] for the stock, sorted. Only history since the last call is
+        fetched and read."""
         now = self.algo.time
         start = self._fetched.get(symbol, now - timedelta(days=self.FILING_LOOKBACK_DAYS))
         if start < now:
-            series = self._series.setdefault(symbol, [])
-            for cls in self._filing_types:
-                self._read_filings(cls, symbol, start, now, series)
-            series.sort(key=lambda item: item[0])
+            levels = self._levels.setdefault(symbol, [])
+            added = False
+            try:
+                for row in self.algo.history[Fundamental](symbol, start, now):
+                    self._stats["rows"] += 1
+                    if not row.has_fundamental_data:
+                        self._stats["no_data"] += 1
+                        continue
+                    level = self._level(row)
+                    if level is None:
+                        self._stats["no_value"] += 1
+                        continue
+                    if levels and levels[-1][1] == level:   # unchanged: no new filing yet
+                        continue
+                    when = (getattr(row, "end_time", None) or row.time) + timedelta(days=1)
+                    if levels and when <= levels[-1][0]:
+                        continue
+                    levels.append((when, level))
+                    self._stats["levels"] += 1
+                    added = True
+            except Exception as error:
+                self._stats["errors"] += 1
+                if self._stats["errors"] <= 5:
+                    self.algo.log(f"FACTOR {symbol.value} history: {error}")
             self._fetched[symbol] = now
+            if added or symbol not in self._series:
+                self._series[symbol] = self._transform(levels)
         return self._series.get(symbol, [])
 
     def summary(self):
-        return f"filings={self._stats} filing_stocks={len(self._series)}"
+        return f"fund={self._stats} fund_stocks={sum(1 for s in self._series.values() if s)}"
 
-    def _read_filings(self, cls, symbol, start, end, series):
-        """Append (usable_from, value) for each 10-K/10-Q filing of `cls` in [start, end].
-        History is chronological, so for "sim" each filing is compared with the previous
-        filing of the same family seen for this stock, including across fetch calls."""
-        algo = self.algo
-        dataset = algo.add_data(cls, symbol, Resolution.DAILY).symbol
-        try:
-            for row in algo.history[cls](dataset, start, end, Resolution.DAILY):
-                report = row.report
-                form = str(report.form_type or "").upper() if report is not None else ""
-                if form not in self._forms:             # e.g. 8-K press releases mislabeled
-                    self._stats["other_form"] += 1
-                    continue
-                key = (symbol, form, row.end_time)
-                if key in self._seen:                    # fetch windows overlap at the edges
-                    continue
-                self._seen.add(key)
-                docs = list(report.documents or [])
-                main = next((d for d in docs if str(d.form_type or "").upper() == form),
-                            docs[0] if docs else None)  # the filing itself, not its exhibits
-                words = words_of(filing_text(main.text or "")) if main is not None else []
-                if len(words) < max(1, self.MIN_FILING_WORDS):
-                    self._stats["too_short"] += 1
-                    continue
-                if self.TEXT_FACTOR == "ld":
-                    value = lexical_density(words)
-                else:
-                    family = "10-K" if form in FORMS_10K else "10-Q"
-                    vec = count_vector(words)
-                    previous = self._prev_vec.get((symbol, family))
-                    self._prev_vec[(symbol, family)] = vec
-                    value = cosine_similarity(previous, vec) if previous is not None else None
-                    if value is None:                   # first filing seen: nothing to compare
-                        self._stats["no_previous"] += 1
-                        continue
-                # Stamped at midnight of the filing date; usable the next day (no lookahead).
-                series.append((row.end_time + timedelta(days=1), value))
-                self._stats["used"] += 1
-        except Exception as error:
-            self._stats["errors"] += 1
-            if self._stats["errors"] <= 5:
-                algo.log(f"FACTOR {symbol.value} {cls.__name__}: {error}")
-        finally:
-            algo.remove_security(dataset)
+    # ---------- Helpers ----------
+
+    def _warn(self, metric, error):
+        """Log the first error per metric (the message names the replacement if one exists)."""
+        self._stats["errors"] += 1
+        if metric not in self._warned:
+            self._warned.add(metric)
+            self.algo.log(f"FACTOR metric {metric}: {error}")
+
+    def _read(self, field, metric):
+        """One number from a Morningstar field, trying each window in turn. None if missing."""
+        for window in self._periods:
+            try:
+                value = float(getattr(field, window))
+            except Exception as error:
+                if "retired" in str(error).lower() or "NotSupported" in type(error).__name__:
+                    self._warn(metric, error)
+                continue
+            if value == value and value not in (0.0, float("inf"), float("-inf")):
+                return value        # 0.0 is Morningstar's "missing", NaN/inf are unusable
+        return None
+
+    def _level(self, row):
+        """Raw level for one daily row: the average of the chosen metrics, or None if any
+        of them is missing (so a composite always uses the same ingredients)."""
+        values = []
+        for metric in self._metrics:
+            group, attr = METRICS[metric]
+            try:
+                field = getattr(getattr(row, group), attr)
+            except Exception as error:
+                self._warn(metric, error)
+                return None
+            value = self._read(field, metric)
+            if value is None:
+                return None
+            values.append(value)
+        return sum(values) / len(values)
+
+    def _transform(self, levels):
+        """Raw levels -> factor values. "yoy": this value minus the value about a year earlier
+        (closest to 365 days back within the allowed window), stamped when the newer value
+        became usable. The first year of data has no YoY value."""
+        if self.FUND_TRANSFORM == "level":
+            return list(levels)
+        out = []
+        for when, value in levels:
+            best = None
+            for earlier_when, earlier_value in levels:
+                gap = (when - earlier_when).days
+                if self.YOY_MIN_DAYS <= gap <= self.YOY_MAX_DAYS:
+                    if best is None or abs(gap - 365) < abs(best[0] - 365):
+                        best = (gap, earlier_value)
+            if best is not None:
+                out.append((when, value - best[1]))
+        return out
