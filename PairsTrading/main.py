@@ -1,6 +1,7 @@
 """
-Distance-method pairs trading with a lexical-density filter (LEAN, Python).
-Paste into a QuantConnect cloud project as main.py. Baseline vs factor: USE_FACTOR.
+Distance-method pairs trading with a pluggable factor (LEAN, Python).
+Paste into a QuantConnect cloud project as main.py, next to factor.py.
+Run mode: SIGNAL_MODE (g / ag / factor).
 
 DEFINITIONS (i, j order is fixed at formation)
   V_i(t)    = P_i(t) / P_i(t0)                growth of $1, adjusted prices
@@ -8,38 +9,64 @@ DEFINITIONS (i, j order is fixed at formation)
   D_ij      = (1/T) * sum_t G_ij(t)^2         raw squared distance, not demeaned
   z_ij(t)   = (G_ij(t) - mu_ij) / sigma_ij    mu, sigma frozen over formation window
   AG_ij(t)  = G_ij(t) / (V_i(t) + V_j(t))     adjusted gap
-  dLD_ij(q) = LD_i(q) - LD_j(q)               report_sentiment.lexical_density
-  Model     : AG_p(q) = alpha + beta * dLD_p(q) + e   pooled OLS, last 4 quarters
-  Residual  : AG(t) - (alpha + beta * dLD latest known)
+  z_ag(t)   = (AG_ij(t) - mu_ag) / sigma_ag   mu, sigma frozen over formation window
+  F_i       = the stock's factor value, from factor.py (Factor.series; the contract is
+              there). Replace factor.py to test a different factor without touching this file.
+  dF_ij(q)  = F_i(q) - F_j(q)
+  Model     : AG_p(q) = alpha + beta * dF_p(q) + e    pooled OLS, last 4 quarters
+  Residual  : AG(t) - (alpha + beta * dF latest known)
   z_resid   = (residual - mean_form) / std_form       frozen between refits
 
-Signal: z_resid if |t(beta)| >= MIN_ABS_T_STAT, otherwise raw z_ij.
-No lookahead: History only returns data with end_time <= the algorithm clock, and
-every normalization constant is frozen at formation or refit.
+Signal by SIGNAL_MODE (three runs, so each change is measured separately):
+  "g"      : z_ij                                   baseline, raw gap
+  "ag"     : z_ag                                   adjusted gap, no factor
+  "factor" : z_resid if |t(beta)| >= MIN_ABS_T_STAT, otherwise z_ag
+"ag" vs "g" isolates the change of gap measure; "factor" vs "ag" isolates the factor.
+In "factor" the fallback is z_ag, not z_ij as in the original spec, so that run only ever
+uses AG and matches "ag" exactly in quarters where the t-stat gate fails.
+
+Entry event filter (ENTRY_EVENT_DAYS > 0): a pair doesn't open if either stock filed an
+8-K with a material item (EVENT_ITEMS: earnings, deals, executive changes, impairments...)
+within the last ENTRY_EVENT_DAYS calendar days. A gap opened by news is likely justified.
+It applies in every SIGNAL_MODE and is independent of the factor.
+
+No lookahead: History only returns data with end_time <= the algorithm clock. SEC records
+are stamped at midnight of the filing date, but filings often land after the close, so a
+filing only counts from the next day, and factor values are used only from their
+usable_from time. Every normalization constant is frozen at formation or refit.
 """
 from AlgorithmImports import *
 from datetime import date, datetime, timedelta
 import numpy as np
 import pandas as pd
+from factor import Factor
 
 # All tunables. Any of these can be overridden by a QC project parameter of the same name.
+# The factor's own settings are in factor.py and are overridden the same way.
 DEFAULTS = {
     "N_UNIVERSE": 1000, "PREFILTER_MULT": 1.5, "MIN_PRICE": 5.0,
     "FORMATION_DAYS": 252, "N_PAIRS": 20,
     "ONE_PAIR_PER_STOCK": True,  # False = a stock may be in several pairs; orders are netted
-    "SAME_INDUSTRY_ONLY": False,
-    "ENTRY_Z": 2.0, "EXIT_Z": 0.5, "STOP_Z": 4.0, "MAX_HOLD_DAYS": 60,
+    "SAME_INDUSTRY_ONLY": True,  # both stocks in the same Morningstar industry group
+    "ENTRY_Z": 2.0, "EXIT_Z": 0.5, "STOP_Z": 6.0, "MAX_HOLD_DAYS": 60,  # stop 6 beat 4 in testing
+    "BLOCK_AFTER_STOP": True,  # False = a stopped pair may re-enter once |z| is back below STOP_Z
     "GROSS_LEVERAGE": 2.0, "SLIPPAGE": 0.0005,
-    "USE_FACTOR": True,        # False = baseline (raw z-score)
-    "REQUIRE_BRAIN": True,     # keep True for both runs so they trade the same pairs
-    "MIN_ABS_T_STAT": 1.0, "STANDARDIZE_LD": True,
-    "LD_VARIANT": "all",       # "all" = 10-K and 10-Q, "10k" = 10-K only
+    "SIGNAL_MODE": "factor",   # "g" = baseline, "ag" = adjusted gap only, "factor" = AG + factor
+    "REQUIRE_FACTOR": True,    # a stock needs a factor value to join a pair; keep the same
+                               # for all runs so they trade the same pairs
+    "MIN_ABS_T_STAT": 1.0, "STANDARDIZE_FACTOR": True,
+    "ENTRY_EVENT_DAYS": 0,     # >0 = skip entries if either stock filed a material 8-K this recently
+    "EVENT_ITEMS": "1.01,1.02,1.03,2.01,2.02,2.05,2.06,3.01,4.01,4.02,5.01,5.02",
+    "EVENT_REANCHOR": False,    # True = when an 8-K window closes, treat the gap's move over it as justified
+    "REANCHOR_MIN_SIGMA": 1.0,  # ...but only if that move exceeds this many formation stds (else noise)
+    "EVENT_REFRESH_DAYS": 5,    # re-anchoring looks up pair stocks' 8-Ks every this many trading days
     "AG_VARIANT": "end",       # "end" = quarter-end AG, "avg" = quarter-average AG
-    "FILING_LAG_DAYS": 45,     # LD(q) is read as of q_end + lag, capped at today
+    "FILING_LAG_DAYS": 45,     # F(q) is read as of q_end + lag, capped at today
     "START_DATE": "2018-01-01", "END_DATE": "",  # empty = latest available
 }
 EXCHANGES = ("NYS", "NAS", "ASE")   # NYSE, NASDAQ, AMEX
 COMMON_STOCK = "ST00000001"         # Morningstar security type for common shares
+SIGNAL_MODES = ("g", "ag", "factor")
 
 
 # ---------- Pure math (no LEAN dependency, unit-tested) ----------
@@ -151,15 +178,21 @@ class Pair:
     def __init__(self, a, b, p0a, p0b, mu, sigma, ag_form, form_dates, formed):
         self.a, self.b, self.key = a, b, (a, b)
         self.p0a, self.p0b = p0a, p0b
-        self.mu, self.sigma = mu, sigma
+        self.mu, self.sigma = mu, sigma                 # G stats over formation
         self.ag_form, self.form_dates, self.formed = ag_form, form_dates, formed
+        self.ag_mu, self.ag_sigma = ag_form.mean(), ag_form.std(ddof=1)   # AG stats
         self.side, self.held = 0, 0                     # side: +1 = long i, short j
         self.entry = None                               # weight, notional, entry prices
         self.blocked = self.broken = False
-        self.model = None                               # alpha, beta, dld, res_mean, res_std
+        self.model = None                               # alpha, beta, df, res_mean, res_std
+        # Re-anchoring: shifts to the pair's normal gap justified by 8-K events.
+        self.shift_g = self.shift_ag = 0.0
+        self.event = None                               # open window: pre-event gap, end time
+        self.event_seen = None                          # latest 8-K date already handled
+        self.recent = []                                # last few (date, G, AG) evaluations
 
 
-class LexicalDensityPairs(QCAlgorithm):
+class FactorPairs(QCAlgorithm):
 
     def initialize(self):
         for name, default in DEFAULTS.items():
@@ -169,13 +202,22 @@ class LexicalDensityPairs(QCAlgorithm):
             self.set_end_date(datetime.strptime(self.END_DATE, "%Y-%m-%d"))
         self.set_cash(1_000_000)
 
-        variants = {"all": BrainCompanyFilingLanguageMetricsAll,
-                    "10k": BrainCompanyFilingLanguageMetrics10K}
-        self._ld_type = variants[self.LD_VARIANT]
+        if self.SIGNAL_MODE not in SIGNAL_MODES:
+            raise ValueError(f"SIGNAL_MODE must be one of {SIGNAL_MODES}, got {self.SIGNAL_MODE!r}")
+
+        self.factor = Factor(self, self._param)   # factor.py
+        self._event_items = {i.strip() for i in self.EVENT_ITEMS.split(",") if i.strip()}
 
         self.pairs, self._candidates, self._groups = [], [], {}
         self._cand_key = self._form_key = self._refit_key = None
-        self._subs, self._brain, self._ld, self._dirty = set(), {}, {}, set()
+        self._subs, self._dirty = set(), set()
+        # Material 8-K dates, filled by short history requests (a live SECReport8K subscription
+        # per pair stock ran out of memory): symbol -> [filing date], symbol -> fetched-up-to.
+        self._events, self._events_fetched = {}, {}
+        self._event_skips = self._event_errors = 0
+        self._reanchor_stats = {"applied": 0, "below_threshold": 0, "no_baseline": 0}
+        if self.EVENT_REANCHOR and self.ENTRY_EVENT_DAYS <= 0:
+            raise ValueError("EVENT_REANCHOR needs ENTRY_EVENT_DAYS > 0 (it sets the window length)")
         self.trades, self.refits = [], []
         self._days = self._active_sum = self._max_positions = 0
         self._gross_sum, self._factor_days, self._raw_days = 0.0, 0, 0
@@ -258,8 +300,10 @@ class LexicalDensityPairs(QCAlgorithm):
         groups = None
         if self.SAME_INDUSTRY_ONLY:
             groups = np.array([self._groups.get(s) or 0 for s in symbols])
-        self._ld = {}
-        usable = (lambda k: bool(self._ld_series(symbols[k]))) if self.REQUIRE_BRAIN else (lambda k: True)
+        if self.REQUIRE_FACTOR:
+            usable = lambda k: as_of(self.factor.series(symbols[k]), self.time) is not None
+        else:
+            usable = lambda k: True
         picks = pick_pairs(rank_pairs(d, groups), self.N_PAIRS, self.ONE_PAIR_PER_STOCK, usable)
 
         previous = {p.key: p for p in self.pairs}
@@ -271,6 +315,8 @@ class LexicalDensityPairs(QCAlgorithm):
                 continue
             pair = Pair(symbols[a], symbols[b], prices[0, a], prices[0, b], gap.mean(), sigma,
                         adjusted_gap(v[:, a], v[:, b]), close.index.values, self.time.date())
+            if pair.ag_sigma < 1e-9:
+                continue
             kept = previous.pop(pair.key, None)
             if kept:                              # re-selected: keep the open position
                 pair.side, pair.held, pair.entry = kept.side, kept.held, kept.entry
@@ -286,8 +332,6 @@ class LexicalDensityPairs(QCAlgorithm):
 
     def _sync_subscriptions(self):
         wanted = {s for p in self.pairs for s in p.key}
-        for symbol in [s for s in self._brain if s not in wanted]:
-            self.remove_security(self._brain.pop(symbol))
         for symbol in self._subs - wanted:
             self.remove_security(symbol)
         for symbol in wanted - self._subs:
@@ -298,35 +342,95 @@ class LexicalDensityPairs(QCAlgorithm):
             security.set_leverage(max(4.0, 2.0 * self.GROSS_LEVERAGE))
         self._subs = wanted
 
-    # ---------- Factor ----------
+    # ---------- 8-K events ----------
 
-    def _ld_series(self, symbol):
-        """[(end_time, lexical density)] known by now. Empty means no Brain data for the stock."""
-        if symbol not in self._ld:
-            if symbol not in self._brain:
-                self._brain[symbol] = self.add_data(self._ld_type, symbol, Resolution.DAILY).symbol
-            rows = self.history[self._ld_type](self._brain[symbol], self.time - timedelta(days=600),
-                                               self.time, Resolution.DAILY)
-            series = []
-            for row in rows:
-                metrics = row.report_sentiment
-                value = metrics.lexical_density if metrics is not None else None
-                if value is not None:
-                    series.append((row.end_time, float(value)))
-            self._ld[symbol] = sorted(series, key=lambda item: item[0])
-        return self._ld[symbol]
+    def _record_event(self, symbol, row):
+        """Store the filing date of a material 8-K (one with an item in EVENT_ITEMS)."""
+        report = row.report
+        if report is None or str(report.form_type or "").upper() != "8-K":
+            return
+        items = {str(i).strip() for i in (report.items or [])}
+        dates = self._events.setdefault(symbol, [])
+        if items & self._event_items and row.end_time not in dates:
+            dates.append(row.end_time)
+
+    def _refresh_events(self, symbol):
+        """Fetch 8-Ks filed since the last fetch for this stock (first time: the last
+        ENTRY_EVENT_DAYS + 5 days). The dataset is added only for the request, then removed."""
+        now = self.time
+        start = self._events_fetched.get(symbol, now - timedelta(days=self.ENTRY_EVENT_DAYS + 5))
+        if start >= now:
+            return
+        dataset = self.add_data(SECReport8K, symbol, Resolution.DAILY).symbol
+        try:
+            for row in self.history[SECReport8K](dataset, start, now, Resolution.DAILY):
+                self._record_event(symbol, row)
+        except Exception as error:
+            self._event_errors += 1
+            if self._event_errors <= 5:
+                self.log(f"FILINGS {symbol.value} SECReport8K: {error}")
+        finally:
+            self.remove_security(dataset)
+        self._events_fetched[symbol] = now
+
+    def _event_dates(self, symbol):
+        """Material 8-K dates usable by now: an 8-K counts from the day after filing."""
+        now = self.time
+        keep = timedelta(days=self.ENTRY_EVENT_DAYS + 5)
+        dates = self._events.get(symbol, [])
+        dates[:] = [d for d in dates if now - d <= keep]
+        return [d for d in dates if d + timedelta(days=1) <= now]
+
+    def _recent_event(self, symbol):
+        """True if the stock filed a material 8-K within the last ENTRY_EVENT_DAYS days.
+        Fetches up to now first, so entry decisions always see every filing to date."""
+        self._refresh_events(symbol)
+        window = timedelta(days=self.ENTRY_EVENT_DAYS)
+        return any(self.time - d <= window for d in self._event_dates(symbol))
+
+    def _track_events(self, pair, g, ag):
+        """Re-anchoring. A new 8-K for either stock opens a window (or extends an open one)
+        and records the gap from the last evaluation before the filing date. When the window
+        closes, the gap's move over it is taken as justified by the news and added to the
+        pair's normal level, if it exceeds REANCHOR_MIN_SIGMA formation stds."""
+        now = self.time
+        window = timedelta(days=self.ENTRY_EVENT_DAYS)
+        latest = max((d for s in pair.key for d in self._event_dates(s)), default=None)
+        if latest is not None and (pair.event_seen is None or latest > pair.event_seen):
+            pair.event_seen = latest
+            if pair.event is None:
+                before = [r for r in pair.recent if r[0] < latest.date()]
+                pair.event = {"pre": before[-1] if before else None, "until": latest + window}
+            else:
+                pair.event["until"] = max(pair.event["until"], latest + window)
+        if pair.event is None or now <= pair.event["until"]:
+            return
+        pre, pair.event = pair.event["pre"], None
+        if pre is None:                     # filed before the pair had any evaluations
+            self._reanchor_stats["no_baseline"] += 1
+            return
+        move_g, move_ag = g - pre[1], ag - pre[2]
+        move, scale = (move_g, pair.sigma) if self.SIGNAL_MODE == "g" else (move_ag, pair.ag_sigma)
+        if abs(move) >= self.REANCHOR_MIN_SIGMA * scale:
+            pair.shift_g += move_g
+            pair.shift_ag += move_ag
+            self._reanchor_stats["applied"] += 1
+        else:
+            self._reanchor_stats["below_threshold"] += 1
+
+    # ---------- Factor regression ----------
 
     def _snapshot(self, symbols, when):
-        """Latest known LD per symbol at `when`, standardized if configured."""
-        raw = {s: as_of(self._ld_series(s), when) for s in symbols}
+        """Latest known factor value per symbol at `when`, standardized if configured."""
+        raw = {s: as_of(self.factor.series(s), when) for s in symbols}
         raw = {s: v for s, v in raw.items() if v is not None}
-        return standardize(raw) if self.STANDARDIZE_LD else raw
+        return standardize(raw) if self.STANDARDIZE_FACTOR else raw
 
     def _factor_diffs(self, pair, snapshot):
         """Regressors for a pair, or None if any is missing.
-        EXTENSION POINT: append more differences here (CapEx/assets, revenue change,
-        text-change measures). fit_ols already handles k factors; the gate and the
-        model dictionary in _refit use beta[0] only and would need extending too."""
+        A different factor goes in factor.py. To use several at once, append more
+        differences here; fit_ols already handles k factors, but the gate and the model
+        dictionary in _refit use beta[0] only and would need extending too."""
         if pair.a not in snapshot or pair.b not in snapshot:
             return None
         return [snapshot[pair.a] - snapshot[pair.b]]
@@ -336,9 +440,8 @@ class LexicalDensityPairs(QCAlgorithm):
         live = [p for p in self.pairs if not p.broken]
         for pair in live:
             pair.model = None
-        if not self.USE_FACTOR or not live:
+        if self.SIGNAL_MODE != "factor" or not live:
             return
-        self._ld = {}
         now = self.time
         quarters = last_quarter_ends(now.date(), 4)
         symbols = sorted({s for p in live for s in p.key}, key=str)
@@ -380,12 +483,12 @@ class LexicalDensityPairs(QCAlgorithm):
                 steps = pd.Series(history[pair.key], dtype=float).ffill().bfill().values
                 if diffs is None or np.isnan(steps).any():
                     continue
-                # dLD is a step function between quarters across the formation window.
+                # dF is a step function between quarters across the formation window.
                 index = np.searchsorted(q_dates, pair.form_dates, side="right") - 1
                 residual = pair.ag_form - (fit["alpha"] + beta * steps[np.clip(index, 0, 3)])
                 res_std = residual.std(ddof=1)
                 if res_std > 1e-9:
-                    pair.model = {"alpha": fit["alpha"], "beta": beta, "dld": diffs[0],
+                    pair.model = {"alpha": fit["alpha"], "beta": beta, "df": diffs[0],
                                   "res_mean": residual.mean(), "res_std": res_std}
                     factor_pairs += 1
         self.log(f"REFIT {now:%Y-%m-%d}: alpha={fit['alpha']:.5f} beta={beta:.5f} t={t_stat:.2f} "
@@ -396,13 +499,16 @@ class LexicalDensityPairs(QCAlgorithm):
     def _signal(self, pair):
         v_a = self.securities[pair.a].price / pair.p0a
         v_b = self.securities[pair.b].price / pair.p0b
+        # shift_g / shift_ag are 0 unless EVENT_REANCHOR moved the pair's normal level.
+        if self.SIGNAL_MODE == "g":
+            return (v_a - v_b - pair.mu - pair.shift_g) / pair.sigma
         model = pair.model
-        if model is None:
+        if model is None:                    # "ag" mode, or "factor" mode with the gate failed
             self._raw_days += 1
-            return (v_a - v_b - pair.mu) / pair.sigma
+            return (adjusted_gap(v_a, v_b) - pair.ag_mu - pair.shift_ag) / pair.ag_sigma
         self._factor_days += 1
-        residual = adjusted_gap(v_a, v_b) - (model["alpha"] + model["beta"] * model["dld"])
-        return (residual - model["res_mean"]) / model["res_std"]
+        residual = adjusted_gap(v_a, v_b) - (model["alpha"] + model["beta"] * model["df"])
+        return (residual - model["res_mean"] - pair.shift_ag) / model["res_std"]
 
     def _tradable(self, symbol):
         if symbol not in self.securities:
@@ -461,6 +567,18 @@ class LexicalDensityPairs(QCAlgorithm):
                 self._break(pair, f"tradable: {pair.a.value}={self._tradable(pair.a)} "
                                   f"{pair.b.value}={self._tradable(pair.b)}")
                 continue
+            if self.EVENT_REANCHOR:
+                # Refresh every EVENT_REFRESH_DAYS evaluations (daily lookups for every pair
+                # stock would be far too slow). A filing may be noticed late, but its window
+                # and pre-filing gap come from the filing date and the stored evaluations.
+                if self._days % self.EVENT_REFRESH_DAYS == 0:
+                    self._refresh_events(pair.a)
+                    self._refresh_events(pair.b)
+                v_a = self.securities[pair.a].price / pair.p0a
+                v_b = self.securities[pair.b].price / pair.p0b
+                g, ag = float(v_a - v_b), float(adjusted_gap(v_a, v_b))
+                self._track_events(pair, g, ag)
+                pair.recent = (pair.recent + [(today, g, ag)])[-40:]
             z = self._signal(pair)
             self._max_abs_z = max(self._max_abs_z, abs(z))
             if pair.side:
@@ -469,11 +587,15 @@ class LexicalDensityPairs(QCAlgorithm):
                     self._close(pair, "converged")
                 elif abs(z) >= self.STOP_Z:
                     self._close(pair, "stop")
-                    pair.blocked = True
+                    pair.blocked = self.BLOCK_AFTER_STOP
                 elif pair.held >= self.MAX_HOLD_DAYS:
                     self._close(pair, "max_hold")
-                    pair.blocked = True
+                    pair.blocked = self.BLOCK_AFTER_STOP
             elif self.ENTRY_Z <= abs(z) < self.STOP_Z:
+                if self.ENTRY_EVENT_DAYS > 0 and (self._recent_event(pair.a)
+                                                  or self._recent_event(pair.b)):
+                    self._event_skips += 1          # gap likely news-driven: don't trade it
+                    continue
                 pair.side = -1 if z > 0 else 1      # z > 0: i is rich, short i, long j
                 weight = self.GROSS_LEVERAGE / (2.0 * max(1, len(active)))
                 pair.entry = {"weight": weight,
@@ -494,14 +616,18 @@ class LexicalDensityPairs(QCAlgorithm):
         count = max(1, len(trades))
         reasons = {r: sum(t["reason"] == r for t in trades)
                    for r in ("converged", "stop", "max_hold", "broken", "reformation")}
-        self.log(f"SUMMARY use_factor={self.USE_FACTOR} trades={len(trades)} "
+        self.log(f"SUMMARY signal_mode={self.SIGNAL_MODE} factor={self.factor.name} "
+                 f"entry_event_days={self.ENTRY_EVENT_DAYS} event_skips={self._event_skips} "
+                 f"reanchor={self.EVENT_REANCHOR} reanchors={self._reanchor_stats} "
+                 f"stop_z={self.STOP_Z} block={self.BLOCK_AFTER_STOP} trades={len(trades)} "
                  f"win_rate={sum(t['pnl'] > 0 for t in trades) / count:.3f} "
                  f"avg_hold={sum(t['held'] for t in trades) / count:.1f} "
                  f"avg_active_pairs={self._active_sum / days:.1f} "
                  f"stop_rate={(reasons['stop'] + reasons['max_hold']) / count:.3f} exits={reasons} "
                  f"avg_gross={self._gross_sum / days:.2f} max_positions={self._max_positions} "
                  f"max_abs_z={self._max_abs_z:.2f} eval_days={self._days} "
-                 f"factor_share={self._factor_days / max(1, self._factor_days + self._raw_days):.3f}")
+                 f"factor_share={self._factor_days / max(1, self._factor_days + self._raw_days):.3f} "
+                 f"event_errors={self._event_errors} {self.factor.summary()}")
         if self.refits:
             betas = [r[2] for r in self.refits]
             self.log(f"SUMMARY refits={len(betas)} beta_mean={np.mean(betas):.5f} "
